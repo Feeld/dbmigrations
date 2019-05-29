@@ -85,7 +85,9 @@ Library
     text >= 0.11,
     configurator >= 0.2,
     split >= 0.2.2,
-    HUnit >= 1.2
+    HUnit >= 1.2,
+    zlib >= 0.6,
+    tar >= 0.5
 
   Hs-Source-Dirs:    src
   Exposed-Modules:
@@ -98,6 +100,7 @@ Library
           Database.Schema.Migrations.Filesystem.Serialize
           Database.Schema.Migrations.Migration
           Database.Schema.Migrations.Store
+          Database.Schema.Migrations.Tarball
           Database.Schema.Migrations.Test.BackendTest
           Moo.CommandHandlers
           Moo.CommandInterface
