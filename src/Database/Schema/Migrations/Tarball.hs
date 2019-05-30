@@ -24,41 +24,46 @@ import Data.Yaml.YamlLight
 
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString      as BS
-import System.IO
 
 type ContentMap = M.Map T.Text BS.ByteString
 
 data TarballStoreError
   = NotImplemented
   | TarballStoreError String
+  | InvalidTarballError String
   deriving (Show, Exception)
 
 
-tarballStore :: TarballStoreSettings -> IO MigrationStore
-tarballStore settings = do
-  eContentMap :: Either (Tar.FormatError, ContentMap) ContentMap  <- withFile (storePath settings) ReadMode $ \h -> do
-    entries <- Tar.read . Gzip.decompress <$> LBS.hGetContents h
-    pure $! Tar.foldlEntries step mempty entries
+tarballStore :: TarballContents -> Either TarballStoreError MigrationStore
+tarballStore contents =
   case eContentMap of
     Right entryMap ->
-      pure MigrationStore
+      Right MigrationStore
         { loadMigration = migrationFromEntry entryMap
         , saveMigration = \_ -> throwIO NotImplemented
         , getMigrations = pure $ mapMaybe (T.stripSuffix ".txt") $ M.keys entryMap
         , fullMigrationName = pure . T.unpack . T.dropEnd 4
         }
-    Left (e, _) -> throwIO e
-  where step :: ContentMap -> Tar.Entry -> ContentMap
-        step !existingMap entry = case entryBs entry of
-          Just bs -> M.insert (T.pack $ Tar.entryPath entry) bs existingMap
-          Nothing -> existingMap
+    Left (e, _) -> Left (InvalidTarballError (show e))
+  where
+  step :: ContentMap -> Tar.Entry -> ContentMap
+  step !existingMap entry =
+    case entryBs entry of
+      Just bs -> M.insert (T.pack $ Tar.entryPath entry) bs existingMap
+      Nothing -> existingMap
 
-        entryBs :: Tar.Entry -> Maybe BS.ByteString
-        entryBs entry = case Tar.entryContent entry of
-          Tar.NormalFile bs _ -> Just $ LBS.toStrict bs
-          _                   -> Nothing
+  entryBs :: Tar.Entry -> Maybe BS.ByteString
+  entryBs entry =
+    case Tar.entryContent entry of
+      Tar.NormalFile bs _ -> Just $ LBS.toStrict bs
+      _                   -> Nothing
+  eContentMap
+    = Tar.foldlEntries step mempty
+    $ Tar.read
+    $ Gzip.decompress
+    $ unTarballContents contents
 
-newtype TarballStoreSettings = TBStore { storePath :: FilePath }
+newtype TarballContents = TBContents { unTarballContents :: LBS.ByteString }
 
 
 -- make everything compile
