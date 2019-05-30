@@ -48,7 +48,7 @@ tarballStore settings = do
   case eContentMap of
     Right entryMap -> do
       pure MigrationStore
-        { loadMigration = undefined
+        { loadMigration = migrationFromEntry entryMap
         , saveMigration = \_ -> throwIO NotImplemented
         , getMigrations = pure $ catMaybes $ map (T.stripSuffix ".txt") $ M.keys entryMap
         , fullMigrationName = pure . T.unpack . T.dropEnd 4
