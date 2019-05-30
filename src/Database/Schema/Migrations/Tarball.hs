@@ -1,6 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE BangPatterns        #-}
 
 
 module Database.Schema.Migrations.Tarball where
@@ -12,7 +13,7 @@ import Database.Schema.Migrations.Store
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as Gzip
-import Control.Exception (throwIO, IOException, Exception, catch, throw)
+import Control.Exception (throwIO, Exception, catch, throw)
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import Data.String.Conversions ( cs, (<>) )
@@ -24,11 +25,10 @@ import Data.Time () -- for UTCTime Show instance
 import Data.Yaml.YamlLight
 
 import qualified Data.ByteString.Lazy as LBS
-import System.Directory ( getDirectoryContents, doesFileExist )
-import System.FilePath ( (</>), takeExtension, dropExtension, takeBaseName )
+import qualified Data.ByteString      as BS
 import System.IO
 
-type EntryMap = M.Map FilePath Tar.Entry
+type ContentMap = M.Map T.Text BS.ByteString
 
 data TarballStoreError = NotImplemented
   deriving (Show, Exception)
@@ -42,20 +42,27 @@ instance Exception FilesystemStoreError
 
 tarballStore :: TarballStoreSettings -> IO MigrationStore
 tarballStore settings = do
-  eEntryMap :: Either (Tar.FormatError, EntryMap) EntryMap  <- withFile (storePath settings) ReadMode $ \h -> do
+  eContentMap :: Either (Tar.FormatError, ContentMap) ContentMap  <- withFile (storePath settings) ReadMode $ \h -> do
     entries <- Tar.read . Gzip.decompress <$> LBS.hGetContents h
-    pure $ Tar.foldlEntries step mempty entries
-  case eEntryMap of
+    pure $! Tar.foldlEntries step mempty entries
+  case eContentMap of
     Right entryMap -> do
       pure MigrationStore
         { loadMigration = undefined
         , saveMigration = \_ -> throwIO NotImplemented
-        , getMigrations = pure $ catMaybes $ map (T.stripSuffix ".txt" . T.pack) $ M.keys entryMap
+        , getMigrations = pure $ catMaybes $ map (T.stripSuffix ".txt") $ M.keys entryMap
         , fullMigrationName = pure . T.unpack . T.dropEnd 4
         }
     Left (e, _) -> throwIO e
-  where step :: EntryMap -> Tar.Entry -> EntryMap
-        step existingMap entry = M.insert (Tar.entryPath entry) entry existingMap
+  where step :: ContentMap -> Tar.Entry -> ContentMap
+        step !existingMap entry = case entryBs entry of
+          Just bs -> M.insert (T.pack $ Tar.entryPath entry) bs existingMap
+          Nothing -> existingMap
+
+        entryBs :: Tar.Entry -> Maybe BS.ByteString
+        entryBs entry = case Tar.entryContent entry of
+          Tar.NormalFile bs _ -> Just $ LBS.toStrict bs
+          _                   -> Nothing
 
 newtype TarballStoreSettings = TBStore { storePath :: FilePath }
 
@@ -64,32 +71,27 @@ newtype TarballStoreSettings = TBStore { storePath :: FilePath }
 -- then change filepath to entry and call it migrationfromentry
 -- to get filepath for name etc you need to say that path = EntryPath,
 -- then parse the bytes from entry. Look at Tar documentations.
-migrationFromPath :: FilePath -> IO (Either String Migration)
-migrationFromPath path = do
-  let name = cs $ takeBaseName path
-  (Right <$> process name) `catch` (\(FilesystemStoreError s) -> return $ Left $ "Could not parse migration " ++ path ++ ":" ++ s)
-
+migrationFromEntry :: ContentMap -> T.Text -> IO (Either String Migration)
+migrationFromEntry contentMap name = do
+  (Right <$> process) `catch` (\(FilesystemStoreError s) -> return $ Left $ "Could not parse migration " ++ T.unpack name ++ ":" ++ s)
   where
-    readMigrationFile = do
-      ymlExists <- doesFileExist (addNewMigrationExtension path)
-      if ymlExists
-        then parseYamlFile (addNewMigrationExtension path) `catch` (\(e::IOException) -> throwFS $ show e)
-        else parseYamlFile (addMigrationExtension path filenameExtensionTxt) `catch` (\(e::IOException) -> throwFS $ show e)
+    process = do
+      case M.lookup name contentMap of
+          Just bs -> do
+            yaml <- parseYamlBytes bs
+            -- Convert yaml structure into basic key/value map
+            let fields = getFields yaml
+                missing = missingFields fields
 
-    process name = do
-      yaml <- readMigrationFile
+            case length missing of
+              0 -> do
+                let newM = emptyMigration name
+                case migrationFromFields newM fields of
+                  Nothing -> throwFS $ "Error in " ++ T.unpack name ++ ": unrecognized field found"
+                  Just m -> return m
+              _ -> throwFS $ "Error in " ++ T.unpack name ++ ": missing required field(s): " ++ (show missing)
 
-      -- Convert yaml structure into basic key/value map
-      let fields = getFields yaml
-          missing = missingFields fields
-
-      case length missing of
-        0 -> do
-          let newM = emptyMigration name
-          case migrationFromFields newM fields of
-            Nothing -> throwFS $ "Error in " ++ (show path) ++ ": unrecognized field found"
-            Just m -> return m
-        _ -> throwFS $ "Error in " ++ (show path) ++ ": missing required field(s): " ++ (show missing)
+          Nothing -> throwFS $ "Error in " ++ T.unpack name ++ ": not found in archive."
 
 
 type FieldProcessor = T.Text -> Migration -> Maybe Migration
