@@ -1,8 +1,7 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE DeriveAnyClass      #-}
 {-# LANGUAGE BangPatterns        #-}
-
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Database.Schema.Migrations.Tarball where
 import Database.Schema.Migrations.Migration
@@ -13,12 +12,11 @@ import Database.Schema.Migrations.Store
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as Gzip
-import Control.Exception (throwIO, Exception, catch, throw)
+import Control.Exception (throwIO, Exception, catch)
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import Data.String.Conversions ( cs, (<>) )
 import qualified Data.Text as T
-import Data.Typeable ( Typeable )
 import Data.Time.Clock ( UTCTime )
 import Data.Time () -- for UTCTime Show instance
 
@@ -30,14 +28,10 @@ import System.IO
 
 type ContentMap = M.Map T.Text BS.ByteString
 
-data TarballStoreError = NotImplemented
+data TarballStoreError
+  = NotImplemented
+  | TarballStoreError String
   deriving (Show, Exception)
-
---refactor out
-data FilesystemStoreError = FilesystemStoreError String
-                            deriving (Show, Typeable)
-
-instance Exception FilesystemStoreError
 
 
 tarballStore :: TarballStoreSettings -> IO MigrationStore
@@ -46,11 +40,11 @@ tarballStore settings = do
     entries <- Tar.read . Gzip.decompress <$> LBS.hGetContents h
     pure $! Tar.foldlEntries step mempty entries
   case eContentMap of
-    Right entryMap -> do
+    Right entryMap ->
       pure MigrationStore
         { loadMigration = migrationFromEntry entryMap
         , saveMigration = \_ -> throwIO NotImplemented
-        , getMigrations = pure $ catMaybes $ map (T.stripSuffix ".txt") $ M.keys entryMap
+        , getMigrations = pure $ mapMaybe (T.stripSuffix ".txt") $ M.keys entryMap
         , fullMigrationName = pure . T.unpack . T.dropEnd 4
         }
     Left (e, _) -> throwIO e
@@ -72,41 +66,41 @@ newtype TarballStoreSettings = TBStore { storePath :: FilePath }
 -- to get filepath for name etc you need to say that path = EntryPath,
 -- then parse the bytes from entry. Look at Tar documentations.
 migrationFromEntry :: ContentMap -> T.Text -> IO (Either String Migration)
-migrationFromEntry contentMap name = do
-  (Right <$> process) `catch` (\(FilesystemStoreError s) -> return $ Left $ "Could not parse migration " ++ T.unpack name ++ ":" ++ s)
+migrationFromEntry contentMap name =
+  (Right <$> process) `catch` (\(TarballStoreError s) -> return $ Left $ "Could not parse migration " ++ T.unpack name ++ ":" ++ s)
   where
-    process = do
+    process =
       case M.lookup name contentMap of
           Just bs -> do
             yaml <- parseYamlBytes bs
             -- Convert yaml structure into basic key/value map
-            let fields = getFields yaml
-                missing = missingFields fields
+            fields <- getFields yaml
+            let missing = missingFields fields
 
             case length missing of
               0 -> do
                 let newM = emptyMigration name
                 case migrationFromFields newM fields of
-                  Nothing -> throwFS $ "Error in " ++ T.unpack name ++ ": unrecognized field found"
+                  Nothing -> throwTBS $ "Error in " ++ T.unpack name ++ ": unrecognized field found"
                   Just m -> return m
-              _ -> throwFS $ "Error in " ++ T.unpack name ++ ": missing required field(s): " ++ (show missing)
+              _ -> throwTBS $ "Error in " ++ T.unpack name ++ ": missing required field(s): " ++ show missing
 
-          Nothing -> throwFS $ "Error in " ++ T.unpack name ++ ": not found in archive."
+          Nothing -> throwTBS $ "Error in " ++ T.unpack name ++ ": not found in archive."
 
 
 type FieldProcessor = T.Text -> Migration -> Maybe Migration
 
-getFields :: YamlLight -> [(T.Text, T.Text)]
-getFields (YMap mp) = map toPair $ M.assocs mp
+getFields :: YamlLight -> IO [(T.Text, T.Text)]
+getFields (YMap mp) = mapM toPair $ M.assocs mp
     where
-      toPair :: (YamlLight, YamlLight) -> (T.Text, T.Text)
-      toPair (YStr k, YStr v) = (cs k, cs v)
-      toPair (k, v) = throwFS $ "Error in YAML input; expected string key and string value, got " ++ (show (k, v))
-getFields _ = throwFS "Error in YAML input; expected mapping"
+      toPair :: (YamlLight, YamlLight) -> IO (T.Text, T.Text)
+      toPair (YStr k, YStr v) = pure (cs k, cs v)
+      toPair (k, v) = throwTBS $ "Error in YAML input; expected string key and string value, got " ++ show (k, v)
+getFields _ = throwTBS "Error in YAML input; expected mapping"
 
 missingFields :: [(T.Text, T.Text)] -> [T.Text]
 missingFields fs =
-    [ k | k <- requiredFields, not (k `elem` inputStrings) ]
+    [ k | k <- requiredFields, k `notElem` inputStrings ]
     where
       inputStrings = map fst fs
 
@@ -127,8 +121,8 @@ addNewMigrationExtension path = path <> filenameExtension
 addMigrationExtension :: FilePath -> String -> FilePath
 addMigrationExtension path ext = path <> ext
 
-throwFS :: String -> a
-throwFS = throw . FilesystemStoreError
+throwTBS :: String -> IO a
+throwTBS = throwIO . TarballStoreError
 
 migrationFromFields :: Migration -> [(T.Text, T.Text)] -> Maybe Migration
 migrationFromFields m [] = Just m
